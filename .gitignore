@@ -1,4 +1,2 @@
-# dotenv files
+node_modules/
 .env
-.env.*
-!.env.example
