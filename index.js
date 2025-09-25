@@ -14,7 +14,7 @@ app.get('/', (req, res) => {
     res.send('Hello World!')
 });
 
-// .env e MONGODB_URI, DB_NAME set kore nao
+// .env e MONGODB_URI, DB_NAME
 const uri = process.env.MONGODB_URI || 'mongodb+srv://<username>:<password>@...';
 const DB_NAME = process.env.DB_NAME || 'YourDbName';
 const COLLECTION = process.env.COLLECTION || 'products';
