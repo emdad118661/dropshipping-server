@@ -1,49 +1,64 @@
-// npm i express cors mongodb dotenv
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000'] })); // React dev URL
+app.set('trust proxy', 1);
 app.use(express.json());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    process.env.FRONTEND_ORIGIN, // e.g. https://your-frontend.onrender.com
+  ].filter(Boolean),
+  credentials: true,
+}));
 
-app.get('/', (req, res) => {
-    res.send('Hello World!')
-});
+app.get('/health', (req, res) => res.json({ ok: true, db: !!global.productsCol }));
 
-// .env e MONGODB_URI, DB_NAME
-const uri = process.env.MONGODB_URI || 'mongodb+srv://<username>:<password>@...';
-const DB_NAME = process.env.DB_NAME || 'YourDbName';
-const COLLECTION = process.env.COLLECTION || 'products';
+app.get('/', (req, res) => res.send('API is running'));
+
+const uri = process.env.MONGODB_URI;
+const DB_NAME = process.env.DB_NAME || 'Dropshipping';
+const COLLECTION = process.env.COLLECTION || 'Products';
 
 const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
+  serverSelectionTimeoutMS: 10000,
 });
 
-let productsCol;
+global.productsCol = null;
 
-async function start() {
-  await client.connect();
-  const db = client.db(DB_NAME);
-  productsCol = db.collection(COLLECTION);
-  console.log(`Connected to ${DB_NAME}.${COLLECTION}`);
-
-  app.listen(port, () => console.log(`API running at http://localhost:${port}`));
-}
-start().catch((e) => {
-  console.error('DB connect error', e);
-  process.exit(1);
-});
-
-// GET all products
-app.get('/products', async (req, res) => {
+async function connectWithRetry() {
   try {
-    const items = await productsCol
-      .find({}, { projection: { /* je field lagbe add/remove koro */ } })
-      .toArray();
+    if (!uri) throw new Error('MONGODB_URI missing');
+    await client.connect();
+    await client.db('admin').command({ ping: 1 });
+    const db = client.db(DB_NAME);
+    global.productsCol = db.collection(COLLECTION);
+    console.log(`Mongo connected → ${DB_NAME}.${COLLECTION}`);
+  } catch (e) {
+    console.error('Mongo connect failed:', e.message);
+    global.productsCol = null;
+    setTimeout(connectWithRetry, 5000); // 5s পরে আবার চেষ্টা
+  }
+}
+
+// server আগে উঠুক, তারপর DB connect চেষ্টা
+app.listen(PORT, () => {
+  console.log('PORT env =', process.env.PORT);
+  console.log(`Server listening on ${PORT}`);
+  connectWithRetry();
+});
+
+// Routes
+app.get('/products', async (req, res) => {
+  if (!global.productsCol) return res.status(503).json({ message: 'DB not ready' });
+  try {
+    const items = await global.productsCol.find({}).toArray();
     res.json(items);
   } catch (e) {
     console.error(e);
@@ -51,10 +66,10 @@ app.get('/products', async (req, res) => {
   }
 });
 
-// single product (optional)
 app.get('/products/:id', async (req, res) => {
+  if (!global.productsCol) return res.status(503).json({ message: 'DB not ready' });
   try {
-    const doc = await productsCol.findOne({ _id: new ObjectId(req.params.id) });
+    const doc = await global.productsCol.findOne({ _id: new ObjectId(req.params.id) });
     if (!doc) return res.status(404).json({ message: 'Not found' });
     res.json(doc);
   } catch {
