@@ -61,3 +61,77 @@ app.get('/products/:id', async (req, res) => {
     res.status(400).json({ message: 'Invalid id' });
   }
 });
+
+// Category value mapping (URL slug -> DB value)
+const CATEGORY_MAP = {
+  clothing: "Clothing",
+  "traditional-wear": "Traditional Wear",
+  footwear: "Footwear",
+  accessories: "Accessories",
+};
+
+// Optional: small helper to read limit/skip/sort from query
+function parseListParams(req) {
+  const limit = Math.max(0, parseInt(req.query.limit, 10) || 0); // 0 = no limit
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const skip = limit ? (page - 1) * limit : 0;
+
+  let sort = undefined;
+  switch (req.query.sort) {
+    case "price-asc": sort = { price: 1 }; break;
+    case "price-desc": sort = { price: -1 }; break;
+    case "name-asc": sort = { name: 1 }; break;
+    case "name-desc": sort = { name: -1 }; break;
+    default: break; // API default order
+  }
+  return { limit, skip, sort };
+}
+
+function listByCategory(categoryValue) {
+  return async (req, res) => {
+    try {
+      if (!productsCol) return res.status(503).json({ message: "DB not ready" });
+
+      const { limit, skip, sort } = parseListParams(req);
+      const cursor = productsCol.find({ category: categoryValue });
+
+      if (sort) cursor.sort(sort);
+      if (skip) cursor.skip(skip);
+      if (limit) cursor.limit(limit);
+
+      const items = await cursor.toArray();
+      res.json(items);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ message: "Failed to fetch products" });
+    }
+  };
+}
+
+// 4 fixed endpoints
+app.get("/products/clothing", listByCategory("Clothing"));
+app.get("/products/traditional-wear", listByCategory("Traditional Wear"));
+app.get("/products/footwear", listByCategory("Footwear"));
+app.get("/products/accessories", listByCategory("Accessories"));
+
+// Generic endpoint (optional): /products/category/:slug
+app.get("/products/category/:slug", async (req, res) => {
+  try {
+    if (!productsCol) return res.status(503).json({ message: "DB not ready" });
+
+    const dbValue = CATEGORY_MAP[req.params.slug.toLowerCase()];
+    if (!dbValue) return res.status(400).json({ message: "Invalid category" });
+
+    const { limit, skip, sort } = parseListParams(req);
+    const cursor = productsCol.find({ category: dbValue });
+    if (sort) cursor.sort(sort);
+    if (skip) cursor.skip(skip);
+    if (limit) cursor.limit(limit);
+
+    const items = await cursor.toArray();
+    res.json(items);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: "Failed to fetch products" });
+  }
+});
