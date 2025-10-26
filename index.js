@@ -173,3 +173,5 @@ process.on("SIGTERM", async () => {
   try { await client.close(); } catch {}
   server.close(() => process.exit(0));
 });
+
+//new desktop found
