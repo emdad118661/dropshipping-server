@@ -44,6 +44,8 @@ const uri = process.env.MONGODB_URI;
 const DB_NAME = process.env.DB_NAME || "Dropshipping";
 const COLLECTION = process.env.COLLECTION || "Products";
 const USERS_COLLECTION = process.env.USERS_COLLECTION || "users";      // NEW
+const ADMINS_COLLECTION = process.env.ADMINS_COLLECTION || 'admins';
+let adminsCol = null;
 
 const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
@@ -56,14 +58,26 @@ let usersCol = null;                                                   // NEW
 async function connectWithRetry() {
   try {
     if (!uri) throw new Error("MONGODB_URI missing");
+
     await client.connect();
     await client.db("admin").command({ ping: 1 });
+
     const db = client.db(DB_NAME);
+
+    // collections
     productsCol = db.collection(COLLECTION);
-    usersCol = db.collection(USERS_COLLECTION);                         // NEW
-    try { await productsCol.createIndex({ category: 1 }); } catch {}
-    try { await usersCol.createIndex({ email: 1 }, { unique: true }); } catch {} // NEW
-    console.log(`Mongo connected → ${DB_NAME}.${COLLECTION} & ${USERS_COLLECTION}`);
+    usersCol    = db.collection(USERS_COLLECTION);
+    adminsCol   = db.collection(ADMINS_COLLECTION);
+
+    // indexes (run in parallel, ignore if exists)
+    await Promise.all([
+      productsCol.createIndex({ category: 1 }).catch(() => {}),
+      usersCol.createIndex({ email: 1 }, { unique: true }).catch(() => {}),
+      adminsCol.createIndex({ employeeId: 1 }, { unique: true }).catch(() => {}),
+      adminsCol.createIndex({ email: 1 }).catch(() => {}),
+    ]);
+
+    console.log(`Mongo connected → ${DB_NAME}.${COLLECTION}, ${USERS_COLLECTION}, ${ADMINS_COLLECTION}`);
 
     // Optional: seed root superadmin from env
     if (process.env.ROOT_ADMIN_EMAIL && process.env.ROOT_ADMIN_PASSWORD) {
@@ -85,6 +99,7 @@ async function connectWithRetry() {
     console.error("Mongo connect failed:", e.message);
     productsCol = null;
     usersCol = null;
+    adminsCol = null; // reset this too
     setTimeout(connectWithRetry, 5000);
   }
 }
@@ -104,11 +119,11 @@ function parseListParams(req) {
 
   let sort;
   switch (req.query.sort) {
-    case "price-asc":  sort = { price: 1 }; break;
+    case "price-asc": sort = { price: 1 }; break;
     case "price-desc": sort = { price: -1 }; break;
-    case "name-asc":   sort = { name: 1 }; break;
-    case "name-desc":  sort = { name: -1 }; break;
-    default:           sort = undefined; // API order (Featured)
+    case "name-asc": sort = { name: 1 }; break;
+    case "name-desc": sort = { name: -1 }; break;
+    default: sort = undefined; // API order (Featured)
   }
   return { limit, page, skip, sort };
 }
@@ -230,6 +245,69 @@ app.post("/auth/logout", (req, res) => {
   res.clearCookie("token", { httpOnly: true, sameSite: "lax" }).json({ ok: true });
 });
 
+// POST /admins - create an admin (recommended: superadmin-only)
+app.post('/admins', auth, requireRole('superadmin'), async (req, res) => {
+  try {
+    if (!usersCol || !adminsCol) return res.status(503).json({ message: 'DB not ready' });
+
+    let { name, employeeId, email, phone, address, password, role } = req.body;
+    if (!name || !employeeId || !email || !password) {
+      return res.status(400).json({ message: 'name, employeeId, email, password are required' });
+    }
+
+    email = email.toLowerCase().trim();
+    employeeId = String(employeeId).trim();
+
+    // sanitize role
+    let roleNorm = (role || 'admin').toString().toLowerCase();
+    if (!['admin', 'superadmin'].includes(roleNorm)) roleNorm = 'admin';
+
+    // unique checks
+    const existsUser = await usersCol.findOne({ email });
+    if (existsUser) return res.status(409).json({ message: 'Email already used' });
+
+    const existsEmp = await adminsCol.findOne({ employeeId });
+    if (existsEmp) return res.status(409).json({ message: 'Employee ID already used' });
+
+    const hash = await bcrypt.hash(password, 10);
+
+    // create login user with chosen role
+    const userDoc = {
+      name,
+      email,
+      phone: phone || '',
+      address: address || '',
+      passwordHash: hash,
+      role: roleNorm,
+      createdAt: new Date(),
+    };
+    const { insertedId: userId } = await usersCol.insertOne(userDoc);
+
+    // create admin profile
+    try {
+      const adminDoc = {
+        userId,
+        name,
+        employeeId,
+        email,
+        phone: phone || '',
+        address: address || '',
+        role: roleNorm, // keep role for listing
+        createdBy: new ObjectId(req.user.sub),
+        createdAt: new Date(),
+      };
+      const { insertedId: adminId } = await adminsCol.insertOne(adminDoc);
+      return res.status(201).json({ ok: true, admin: { _id: adminId, userId, name, employeeId, email, phone, address, role: roleNorm } });
+    } catch (e) {
+      await usersCol.deleteOne({ _id: userId });
+      throw e;
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to create admin' });
+  }
+});
+
 // Current user
 app.get("/auth/me", auth, async (req, res) => {
   try {
@@ -293,33 +371,6 @@ app.put('/auth/change-password', auth, async (req, res) => {
   }
 });
 
-// OPTIONAL: superadmin can create admins
-app.post("/admin/create-admin", auth, requireRole("superadmin"), async (req, res) => {
-  try {
-    if (!usersCol) return res.status(503).json({ message: "DB not ready" });
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ message: "Missing fields" });
-
-    const emailL = email.toLowerCase();
-    const exists = await usersCol.findOne({ email: emailL });
-    if (exists) return res.status(409).json({ message: "Email already used" });
-
-    const hash = await bcrypt.hash(password, 10);
-    const { insertedId } = await usersCol.insertOne({
-      name,
-      email: emailL,
-      passwordHash: hash,
-      role: "admin",
-      createdAt: new Date(),
-      createdBy: new ObjectId(req.user.sub),
-    });
-    res.status(201).json({ id: insertedId, email: emailL, role: "admin" });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ message: "Failed to create admin" });
-  }
-});
-
 // ===== Routes (Products — unchanged) =====
 
 // IMPORTANT: category route BEFORE ":id" route (otherwise /products/category/... will hit :id)
@@ -342,10 +393,10 @@ app.get("/products/category/:slug", async (req, res) => {
 });
 
 // Fixed category shortcuts
-app.get("/products/clothing",          listByCategory("Clothing"));
-app.get("/products/traditional-wear",  listByCategory("Traditional Wear"));
-app.get("/products/footwear",          listByCategory("Footwear"));
-app.get("/products/accessories",       listByCategory("Accessories"));
+app.get("/products/clothing", listByCategory("Clothing"));
+app.get("/products/traditional-wear", listByCategory("Traditional Wear"));
+app.get("/products/footwear", listByCategory("Footwear"));
+app.get("/products/accessories", listByCategory("Accessories"));
 
 // All products
 app.get("/products", async (req, res) => {
@@ -386,6 +437,6 @@ const server = app.listen(PORT, () => {
 });
 
 process.on("SIGTERM", async () => {
-  try { await client.close(); } catch {}
+  try { await client.close(); } catch { }
   server.close(() => process.exit(0));
 });
