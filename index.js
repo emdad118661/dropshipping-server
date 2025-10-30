@@ -245,6 +245,54 @@ app.get("/auth/me", auth, async (req, res) => {
   }
 });
 
+// PUT /auth/me - update profile (name, phone, address)
+app.put('/auth/me', auth, async (req, res) => {
+  try {
+    if (!usersCol) return res.status(503).json({ message: 'DB not ready' });
+    const { name, phone, address } = req.body;
+    if (!name) return res.status(400).json({ message: 'Name is required' });
+
+    const _id = new ObjectId(req.user.sub);
+    const update = {
+      ...(name !== undefined && { name }),
+      ...(phone !== undefined && { phone }),
+      ...(address !== undefined && { address }),
+      updatedAt: new Date(),
+    };
+
+    await usersCol.updateOne({ _id }, { $set: update });
+    const user = await usersCol.findOne({ _id }, { projection: { passwordHash: 0 } });
+    res.json({ user });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to update profile' });
+  }
+});
+
+// PUT /auth/change-password - requires currentPassword + newPassword
+app.put('/auth/change-password', auth, async (req, res) => {
+  try {
+    if (!usersCol) return res.status(503).json({ message: 'DB not ready' });
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ message: 'Both currentPassword and newPassword are required' });
+    if (newPassword.length < 6) return res.status(400).json({ message: 'New password must be at least 6 characters' });
+
+    const _id = new ObjectId(req.user.sub);
+    const user = await usersCol.findOne({ _id });
+    if (!user) return res.status(401).json({ message: 'Unauthorized' });
+
+    const ok = await require('bcryptjs').compare(currentPassword, user.passwordHash);
+    if (!ok) return res.status(401).json({ message: 'Current password is incorrect' });
+
+    const hash = await require('bcryptjs').hash(newPassword, 10);
+    await usersCol.updateOne({ _id }, { $set: { passwordHash: hash, updatedAt: new Date() } });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Failed to change password' });
+  }
+});
+
 // OPTIONAL: superadmin can create admins
 app.post("/admin/create-admin", auth, requireRole("superadmin"), async (req, res) => {
   try {
