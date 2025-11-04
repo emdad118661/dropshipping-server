@@ -3,9 +3,12 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");                // NEW
 const bcrypt = require("bcryptjs");                           // NEW
-const jwt = require("jsonwebtoken");                          // NEW
+const jwt = require("jsonwebtoken");
+const nodemailer = require('nodemailer');
+const { v4: uuidv4 } = require('uuid');                          // NEW
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -53,7 +56,19 @@ const client = new MongoClient(uri, {
 });
 
 let productsCol = null;
-let usersCol = null;                                                   // NEW
+let usersCol = null;
+let ordersCol = null;
+
+let mailer;
+function buildTransport() {
+  mailer = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: true,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+}
+buildTransport();                                                   // NEW
 
 async function connectWithRetry() {
   try {
@@ -66,15 +81,17 @@ async function connectWithRetry() {
 
     // collections
     productsCol = db.collection(COLLECTION);
-    usersCol    = db.collection(USERS_COLLECTION);
-    adminsCol   = db.collection(ADMINS_COLLECTION);
+    usersCol = db.collection(USERS_COLLECTION);
+    adminsCol = db.collection(ADMINS_COLLECTION);
+    ordersCol = db.collection('orders');
+    try { await ordersCol.createIndex({ orderId: 1 }, { unique: true }); } catch { }
 
     // indexes (run in parallel, ignore if exists)
     await Promise.all([
-      productsCol.createIndex({ category: 1 }).catch(() => {}),
-      usersCol.createIndex({ email: 1 }, { unique: true }).catch(() => {}),
-      adminsCol.createIndex({ employeeId: 1 }, { unique: true }).catch(() => {}),
-      adminsCol.createIndex({ email: 1 }).catch(() => {}),
+      productsCol.createIndex({ category: 1 }).catch(() => { }),
+      usersCol.createIndex({ email: 1 }, { unique: true }).catch(() => { }),
+      adminsCol.createIndex({ employeeId: 1 }, { unique: true }).catch(() => { }),
+      adminsCol.createIndex({ email: 1 }).catch(() => { }),
     ]);
 
     console.log(`Mongo connected → ${DB_NAME}.${COLLECTION}, ${USERS_COLLECTION}, ${ADMINS_COLLECTION}`);
@@ -368,6 +385,87 @@ app.put('/auth/change-password', auth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to change password' });
+  }
+});
+
+// POST /orders/cod
+// body: { productId, qty, options: { size, color }, customer: { name, email, phone, address } }
+app.post('/orders/cod', async (req, res) => {
+  try {
+    if (!productsCol || !ordersCol) return res.status(503).json({ message: 'DB not ready' });
+
+    const { productId, qty, options = {}, customer = {} } = req.body;
+    if (!ObjectId.isValid(productId)) return res.status(400).json({ message: 'Invalid productId' });
+    if (!qty || qty <= 0) return res.status(400).json({ message: 'Invalid qty' });
+    if (!customer.name || !customer.email || !customer.phone || !customer.address) {
+      return res.status(400).json({ message: 'Missing customer fields' });
+    }
+
+    const product = await productsCol.findOne({ _id: new ObjectId(productId) });
+    if (!product) return res.status(404).json({ message: 'Product not found' });
+
+    const unitPrice = Number(product.price || 0);
+    const quantity = Math.min(Number(qty), Number(product.stock || qty));
+    const total = unitPrice * quantity;
+
+    const orderId = uuidv4(); // public id
+    const doc = {
+      orderId,
+      product: {
+        _id: product._id,
+        name: product.name,
+        price: unitPrice,
+        selected: { size: options.size || null, color: options.color || null },
+        qty: quantity,
+      },
+      amount: { subtotal: total, currency: 'BDT' },
+      payment: { method: 'COD', status: 'UNPAID' },
+      customer: {
+        name: customer.name,
+        email: customer.email.toLowerCase(),
+        phone: customer.phone,
+        address: customer.address,
+      },
+      status: 'PLACED', // PLACED -> CONFIRMED -> SHIPPED -> DELIVERED
+      createdAt: new Date(),
+      createdBy: req.user ? new ObjectId(req.user.sub) : null, // optional if logged in
+    };
+
+    await ordersCol.insertOne(doc);
+
+    // Optional: decrement stock
+    try {
+      if (Number.isFinite(product.stock)) {
+        await productsCol.updateOne({ _id: product._id }, { $inc: { stock: -quantity } });
+      }
+    } catch {}
+
+    // Send email (basic)
+    try {
+      if (mailer) {
+        await mailer.sendMail({
+          from: process.env.FROM_EMAIL || process.env.SMTP_USER,
+          to: customer.email,
+          subject: `Order placed successfully (OrderID: ${orderId})`,
+          html: `
+            <h2>Thanks for your order!</h2>
+            <p>Order ID: <strong>${orderId}</strong></p>
+            <p>Product: ${product.name}</p>
+            <p>Qty: ${quantity}</p>
+            <p>Total: ৳${total}</p>
+            <p>Payment Method: Cash on Delivery</p>
+            <p>We will contact you soon for confirmation.</p>
+          `,
+        });
+      }
+    } catch (e) {
+      console.warn('Email send failed:', e.message);
+    }
+
+    res.status(201).json({ ok: true, orderId });
+  } catch (e) {
+    console.error('COD order error:', e);
+    res.status(500).json({ message: 'Failed to place order' });
   }
 });
 
